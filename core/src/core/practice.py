@@ -55,6 +55,7 @@ def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
         *input_fmt,
         "-i", device,
         "-vframes", "1",
+        "-s", "1280x720",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-vcodec", "rawvideo",
         "pipe:1",
