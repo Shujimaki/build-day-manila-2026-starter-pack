@@ -44,49 +44,67 @@ def _get_agent() -> Agent:
     return _agent
 
 # ---------------------------------------------------------------------------
-# System prompt — engineered for charades / action guessing
+# System prompt — charades expert with cross-language support
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
-You are the world's best charades interpreter. You watch a live camera feed of \
-a person acting out a word or phrase using ONLY body language, gestures, and \
-mime — no speaking, no props with text.
+You are the world's best charades interpreter. You watch a live camera feed \
+of a person acting out a word or phrase using ONLY body language, gestures, \
+and mime — no speaking, no props with text.
 
-YOUR TASK: Figure out what word or phrase the person is acting out.
+YOUR TASK: Identify the word or phrase being acted out. The answer could be \
+in ENGLISH or FILIPINO (Tagalog). You must consider BOTH languages.
 
 ## How to analyze each frame
 
-1. **Observe the body**: What are the hands doing? Arms? Head? Full body posture?
-2. **Identify the gesture type**:
-   - Mime of an ACTION (swimming, eating, driving, flying, typing, sleeping…)
-   - Mime of an OBJECT (holding shape, outlining with hands…)
-   - Mime of an ANIMAL (crawling, flapping, slithering…)
-   - Mime of a CONCEPT/EMOTION (love = heart shape, cold = shivering, happy = smile gesture…)
-   - Acting out a SCENE (movie, book title, song…)
-   - Common charades CONVENTIONS: pointing to ear = "sounds like", holding up \
-fingers = number of words/syllables
-3. **Consider temporal context**: You will be told what was observed in \
-previous frames. A gesture may unfold over several seconds — connect the dots.
-4. **Generate your best guess**: 1-5 words. Be specific. Prefer the exact \
-word/phrase being acted out.
+1. **Observe carefully**: hands, arms, head, full body posture, facial expression, \
+movement direction, speed, repetition.
+2. **Identify the gesture category**:
+   - ACTIONS/VERBS: swimming (langoy), eating (kain), driving, flying (lipad), \
+typing, sleeping (tulog), dancing (sayaw), cooking (luto), crying (iyak)…
+   - OBJECTS: shaping with hands, outlining, holding invisible items…
+   - ANIMALS: crawling, flapping, slithering, pouncing…
+   - EMOTIONS/CONCEPTS: love (mahal), cold (malamig), happy (masaya), \
+anger (galit), fear (takot), freedom (kalayaan), time (oras)…
+   - PROFESSIONS: doctor, teacher (guro), police (pulis), chef…
+   - ABSTRACT IDEAS: gravity, silence (katahimikan), irony, awkward, \
+beauty (ganda), strength (lakas), peace (kapayapaan)…
+   - SCENES/TITLES: movie, song, book, TV show titles…
+   - CHARADES CONVENTIONS: ear point = "sounds like", fingers up = word/syllable count
+3. **Consider temporal context**: Previous frames are provided. Gestures unfold \
+over time — connect the sequence.
+4. **Think across difficulty levels**:
+   - Easy: obvious everyday actions (waving, eating, sleeping)
+   - Medium: nuanced concepts or less obvious actions (surfing, meditating)
+   - Hard: abstract ideas, complex phrases, or unusual words (déjà vu, gravity, \
+pag-asa, kalayaan, bayanihan)
+
+## Output format
+Respond with ONLY your single best guess (1-5 words), nothing else.
+The guess can be in English or Filipino — whichever you believe is the answer.
+
+Examples:
+- "swimming"
+- "mahal"
+- "cooking"
+- "kalayaan"
+- "SKIP"
 
 ## Rules
-- Respond with ONLY your guess (1-5 words), nothing else.
-- If you truly cannot see any meaningful gesture (e.g., the person hasn't \
-started, or the frame is blurry/black), respond with exactly "SKIP".
-- NEVER repeat a guess that was already tried (you'll be told which ones).
-- Be AGGRESSIVE with guessing — a wrong guess costs little, but speed matters.
-- Think about common charades words: everyday actions, animals, emotions, \
-movies, sports, professions, food items.
-- Consider abstract or difficult words too: freedom, gravity, time, silence, \
-awkward, irony.
+- If you cannot see any meaningful gesture, respond with exactly "SKIP".
+- NEVER repeat a guess already tried (you'll be told which ones).
+- Be AGGRESSIVE — wrong guesses cost little, speed wins.
+- The judge uses semantic matching, so "sharks" matches "shark" and \
+"swimming" matches "swim". Focus on the CORE CONCEPT.
+- You only get 10 guesses per round, so make each one count.
+- Prefer the MOST LIKELY answer. Don't hedge — commit to one guess.
 """
 
 # ---------------------------------------------------------------------------
 # State — persists across frames within a round
 # ---------------------------------------------------------------------------
 
-# Rolling observations from recent frames (last N frame descriptions)
+# Rolling observations from recent frames
 _frame_observations: deque[str] = deque(maxlen=8)
 
 # All guesses we've submitted this round (to avoid repeats)
@@ -108,20 +126,18 @@ def reset_round() -> None:
     _consecutive_skips = 0
 
 
-
-
-
 # ---------------------------------------------------------------------------
 # Core analysis function
 # ---------------------------------------------------------------------------
 
 
 async def analyze(frame: Frame) -> str | None:
-    """Analyze a single frame and return a guess, or None to skip.
+    """Analyze a single frame and return a single guess, or None to skip.
 
-    Uses temporal context (previous frame observations) and guess history
-    to make the smartest possible guess. Progressively more aggressive
-    as frames accumulate without a correct answer.
+    Strategy:
+    - Sends frame + temporal context to vision LLM
+    - Model returns ONE best guess (preserves the 10-guess budget)
+    - Deduplicates against all prior guesses
 
     Args:
         frame: A Frame with .image (PIL Image) and .timestamp.
@@ -140,7 +156,6 @@ async def analyze(frame: Frame) -> str | None:
     # Build the user message with context
     context_parts: list[str] = []
 
-    # Add temporal context from previous frames
     if _frame_observations:
         history = "\n".join(
             f"  Frame {i+1}: {obs}"
@@ -148,33 +163,29 @@ async def analyze(frame: Frame) -> str | None:
         )
         context_parts.append(f"PREVIOUS OBSERVATIONS:\n{history}")
 
-    # Add guess deduplication context
     if _previous_guesses:
         tried = ", ".join(f'"{g}"' for g in _previous_guesses)
         context_parts.append(
-            f"ALREADY GUESSED (do NOT repeat these): {tried}"
+            f"ALREADY GUESSED (do NOT repeat): {tried}"
         )
 
     # Adaptive urgency
-    if _consecutive_skips >= 3:
+    if _consecutive_skips >= 2:
         context_parts.append(
-            "⚠️ You have skipped several frames. You MUST make a guess now, "
-            "even if uncertain. Any reasonable guess is better than skipping."
+            "⚠️ Multiple frames skipped. You MUST guess now — even if uncertain."
         )
-    elif _frame_count >= 5 and not _previous_guesses:
+    elif _frame_count >= 4 and not _previous_guesses:
         context_parts.append(
-            "You've seen multiple frames without guessing. Time to commit "
-            "to your best guess — speed matters!"
+            "Several frames seen with no guess yet. Commit to your best guess!"
         )
 
-    # Combine context + instruction
     context_block = "\n\n".join(context_parts) if context_parts else ""
 
     user_message = (
         f"{context_block}\n\n"
-        "Look at this frame from the live camera. "
-        "What word or phrase is the person acting out in charades? "
-        "Reply with ONLY your guess (1-5 words) or SKIP."
+        "What word or phrase is this person acting out? "
+        "Give your SINGLE best guess (English or Filipino). "
+        "Or reply SKIP."
     ).strip()
 
     # Call the vision model
@@ -193,14 +204,12 @@ async def analyze(frame: Frame) -> str | None:
     # Handle SKIP
     if answer.upper() == "SKIP":
         _consecutive_skips += 1
-        # Store a minimal observation even on skip
         _frame_observations.append("(no clear gesture detected)")
         return None
 
-    # We got a guess — reset skip counter
     _consecutive_skips = 0
 
-    # Store this frame's observation for future context
+    # Store observation for temporal context
     _frame_observations.append(f"Guessed: {answer}")
 
     # Deduplicate: don't submit if we already guessed this
@@ -208,7 +217,7 @@ async def analyze(frame: Frame) -> str | None:
         print(f"  [agent] Duplicate guess avoided: {answer}")
         return None
 
-    # Record the guess
+    # Record and submit the guess
     _previous_guesses.append(answer)
-
     return answer
+
